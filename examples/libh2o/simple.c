@@ -32,13 +32,14 @@
 #include "h2o/http2.h"
 #include "h2o/memcached.h"
 
-#define USE_HTTPS 1
+#define USE_HTTPS 0
 #define USE_MEMCACHED 0
 
 static h2o_pathconf_t *register_handler(h2o_hostconf_t *hostconf, const char *path, int (*on_req)(h2o_handler_t *, h2o_req_t *))
 {
     h2o_pathconf_t *pathconf = h2o_config_register_path(hostconf, path, 0);
     h2o_handler_t *handler = h2o_create_handler(pathconf, sizeof(*handler));
+    handler->supports_request_streaming = 0x01;
     handler->on_req = on_req;
     return pathconf;
 }
@@ -73,16 +74,48 @@ static int reproxy_test(h2o_handler_t *self, h2o_req_t *req)
     return 0;
 }
 
+static void __resp_ok(h2o_req_t *req)
+{
+    static h2o_generator_t generator = {NULL, NULL};
+    req->res.status = 200;
+    req->res.reason = "OK";
+    h2o_add_header(&req->pool, &req->res.headers, H2O_TOKEN_CONTENT_TYPE, NULL, H2O_STRLIT("text/plain; charset=utf-8"));
+    h2o_start_response(req, &generator);
+    h2o_send(req, &req->entity, 1, 1);
+}
+
+static int __write_req_cb(void *ctx, h2o_iovec_t chunk, int is_end_stream)
+{
+    h2o_req_t *req = ctx;
+    fprintf(stderr, "chunk %zu bytes, is_end_stream %d @ %d\n", chunk.len, is_end_stream, __LINE__);
+
+    if (req->proceed_req) {
+        fprintf(stderr, "req->entity %zu bytes @ %d\n", req->entity.len, __LINE__);
+    }
+    if (is_end_stream) {
+        __resp_ok(req);
+    } else {
+        int is_end_entity = 0;
+        req->proceed_req(req, chunk.len, is_end_entity);
+    }
+    return 0;
+}
+
 static int post_test(h2o_handler_t *self, h2o_req_t *req)
 {
     if (h2o_memis(req->method.base, req->method.len, H2O_STRLIT("POST")) &&
         h2o_memis(req->path_normalized.base, req->path_normalized.len, H2O_STRLIT("/post-test/"))) {
-        static h2o_generator_t generator = {NULL, NULL};
-        req->res.status = 200;
-        req->res.reason = "OK";
-        h2o_add_header(&req->pool, &req->res.headers, H2O_TOKEN_CONTENT_TYPE, NULL, H2O_STRLIT("text/plain; charset=utf-8"));
-        h2o_start_response(req, &generator);
-        h2o_send(req, &req->entity, 1, 1);
+        if (req->proceed_req) {
+            fprintf(stderr, "proceed_req is not NULL @ %d\n", __LINE__);
+            req->write_req.cb = __write_req_cb;
+            req->write_req.ctx = req;
+            fprintf(stderr, "req->entity %zu bytes @ %d\n", req->entity.len, __LINE__);
+            int is_end_entity = 0;
+            req->proceed_req(req, req->entity.len, is_end_entity);
+        } else {
+            fprintf(stderr, "proceed_req is NULL@ %d\n", __LINE__);
+            __resp_ok(req);
+        }
         return 0;
     }
 

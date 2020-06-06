@@ -58,6 +58,14 @@ struct st_h2o_evloop_socket_t {
     } _wreq;
     struct st_h2o_evloop_socket_t *_next_pending;
     struct st_h2o_evloop_socket_t *_next_statechanged;
+#if H2O_USE_IO_URING
+    /* input data for async io */
+    struct {
+        struct {
+            h2o_iovec_t iov;
+        } _rreq;
+    } _async_io;
+#endif
 };
 
 static void link_to_pending(struct st_h2o_evloop_socket_t *sock);
@@ -73,7 +81,7 @@ static void evloop_do_on_socket_create(struct st_h2o_evloop_socket_t *sock);
 static void evloop_do_on_socket_close(struct st_h2o_evloop_socket_t *sock);
 static void evloop_do_on_socket_export(struct st_h2o_evloop_socket_t *sock);
 
-#if H2O_USE_POLL || H2O_USE_EPOLL || H2O_USE_KQUEUE
+#if H2O_USE_POLL || H2O_USE_EPOLL || H2O_USE_KQUEUE || H2O_USE_IO_URING
 /* explicitly specified */
 #else
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
@@ -83,6 +91,11 @@ static void evloop_do_on_socket_export(struct st_h2o_evloop_socket_t *sock);
 #else
 #define H2O_USE_POLL 1
 #endif
+#endif
+
+#if H2O_USE_IO_URING
+static void async_on_read_core(struct st_h2o_evloop_socket_t *sock, ssize_t rret);
+static void async_on_write_core(struct st_h2o_evloop_socket_t *sock, ssize_t wret);
 #endif
 
 #if H2O_USE_POLL
@@ -115,6 +128,46 @@ static void link_to_statechanged(struct st_h2o_evloop_socket_t *sock)
     }
 }
 
+#if H2O_USE_IO_URING
+static const char *async_prepare_read_core(struct st_h2o_evloop_socket_t *sock, h2o_buffer_t **input)
+{
+    sock->_async_io._rreq.iov = h2o_buffer_try_reserve(input, 4096);
+    if (sock->_async_io._rreq.iov.base == NULL) {
+        /* memory allocation failed */
+        return h2o_socket_error_out_of_memory;
+    }
+    return evloop_async_read(sock, &sock->_async_io._rreq.iov, 1);
+}
+
+static void async_on_read_core(struct st_h2o_evloop_socket_t *sock, ssize_t rret)
+{
+    h2o_buffer_t **input = sock->super.ssl == NULL ? &sock->super.input : &sock->super.ssl->input.encrypted;
+    size_t prev_size = sock->super.input->size;
+    h2o_iovec_t *buf = &sock->_async_io._rreq.iov;
+    const char *err = NULL;
+
+    assert(buf->base);
+    if (rret < 0) {
+        err = h2o_socket_error_io;
+        goto Notify;
+    } else if (rret == 0) {
+        err = h2o_socket_error_closed; /* TODO notify close */
+        goto Notify;
+    }
+
+    if (sock->super.ssl != NULL && sock->super.ssl->handshake.cb == NULL)
+        err = decode_ssl_input(&sock->super);
+    (*input)->size += rret;
+
+Notify:
+    /* the application may get notified even if no new data is avaiable.  The
+     * behavior is intentional; it is designed as such so that the applications
+     * can update their timeout counters when a partial SSL record arrives.
+     */
+    sock->super.bytes_read += sock->super.input->size - prev_size;
+    sock->super._cb.read(&sock->super, err);
+}
+#endif
 static const char *on_read_core(int fd, h2o_buffer_t **input)
 {
     int read_any = 0;
@@ -156,6 +209,66 @@ static void wreq_free_buffer_if_allocated(struct st_h2o_evloop_socket_t *sock)
         sock->_wreq.bufs = sock->_wreq.smallbufs;
     }
 }
+
+#if H2O_USE_IO_URING
+static int async_prepare_write_core(struct st_h2o_evloop_socket_t *sock, h2o_iovec_t *bufs, size_t bufcnt)
+{
+    assert(bufcnt <= IOV_MAX); // TODO:
+    if (bufcnt > IOV_MAX)
+        return -1;
+    return evloop_async_write(sock, bufs, bufcnt);
+}
+
+static void async_on_write_core(struct st_h2o_evloop_socket_t *sock, ssize_t wret)
+{
+    assert(sock->_wreq.cnt > 0);
+    if (wret < 0) {
+        wreq_free_buffer_if_allocated(sock);
+        /* fill in _wreq.bufs with fake data to indicate error */
+        sock->_wreq.bufs = sock->_wreq.smallbufs;
+        sock->_wreq.cnt = 1;
+        *sock->_wreq.bufs = h2o_iovec_init(H2O_STRLIT("deadbeef"));
+        sock->_flags |= H2O_SOCKET_FLAG_IS_WRITE_NOTIFY;
+        link_to_pending(sock);
+        return;
+    } else if (wret > 0) {
+        size_t left = wret;
+        h2o_iovec_t *buf = sock->_wreq.bufs;
+        while (sock->_wreq.cnt > 0) {
+            if (left < buf->len) {
+                break;
+            }
+            left -= buf->len;
+            ++buf;
+            --sock->_wreq.cnt;
+        }
+        if (sock->_wreq.cnt == 0) {
+            goto Complete;
+        } else {
+            buf->base += left;
+            buf->len -= left;
+            sock->_wreq.bufs[0] = *buf;
+            size_t i;
+            for (i = 1; i < sock->_wreq.cnt; ++i)
+                sock->_wreq.bufs[i] = bufs[i];
+            goto InComplete;
+        }
+    } else {
+        goto InComplete;
+    }
+
+InComplete:
+    /* schedule the write */
+    link_to_statechanged(sock);
+    return;
+
+Complete:
+    wreq_free_buffer_if_allocated(sock);
+    sock->_flags |= H2O_SOCKET_FLAG_IS_WRITE_NOTIFY;
+    link_to_pending(sock);
+    link_to_statechanged(sock); /* might need to disable the write polling */
+}
+#endif
 
 static int write_core(int fd, h2o_iovec_t **bufs, size_t *bufcnt, size_t *first_buf_written)
 {
@@ -208,6 +321,10 @@ void write_pending(struct st_h2o_evloop_socket_t *sock)
     if (sock->_wreq.cnt == 0)
         goto Complete;
 
+#if H2O_USE_IO_URING
+    if (async_prepare_write_core(sock, sock->_wreq.bufs, sock->_wreq.cnt) == 0)
+        return;
+#else
     /* write */
     if (write_core(sock->fd, &sock->_wreq.bufs, &sock->_wreq.cnt, &first_buf_written) == 0 && sock->_wreq.cnt != 0) {
         /* partial write */
@@ -215,6 +332,7 @@ void write_pending(struct st_h2o_evloop_socket_t *sock)
         sock->_wreq.bufs[0].len -= first_buf_written;
         return;
     }
+#endif
 
     /* either completed or failed */
     wreq_free_buffer_if_allocated(sock);
@@ -233,8 +351,15 @@ static void read_on_ready(struct st_h2o_evloop_socket_t *sock)
     if ((sock->_flags & H2O_SOCKET_FLAG_DONT_READ) != 0)
         goto Notify;
 
+#if H2O_USE_IO_URING
+    if ((err = async_prepare_read_core(sock->fd,
+                                       sock->super.ssl == NULL ? &sock->super.input : &sock->super.ssl->input.encrypted)) != NULL)
+        goto Notify;
+    return;
+#else
     if ((err = on_read_core(sock->fd, sock->super.ssl == NULL ? &sock->super.input : &sock->super.ssl->input.encrypted)) != NULL)
         goto Notify;
+#endif
 
     if (sock->super.ssl != NULL && sock->super.ssl->handshake.cb == NULL)
         err = decode_ssl_input(&sock->super);
@@ -271,6 +396,28 @@ void do_write(h2o_socket_t *_sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_socket_
     assert(sock->_wreq.cnt == 0);
     sock->super._cb.write = cb;
 
+#if H2O_USE_IO_URING
+    /* setup the buffer to send data */
+    if (bufcnt <= sizeof(sock->_wreq.smallbufs) / sizeof(sock->_wreq.smallbufs[0])) {
+        sock->_wreq.bufs = sock->_wreq.smallbufs;
+    } else {
+        sock->_wreq.bufs = h2o_mem_alloc(sizeof(h2o_iovec_t) * bufcnt);
+        sock->_wreq.alloced_ptr = sock->_wreq.bufs;
+    }
+    for (i = 0; i < bufcnt; ++i)
+        sock->_wreq.bufs[i] = bufs[i];
+    sock->_wreq.cnt = bufcnt;
+    if (async_prepare_write_core(sock, sock->_wreq.bufs, sock->_wreq.cnt) != 0) {
+        wreq_free_buffer_if_allocated(sock);
+        /* fill in _wreq.bufs with fake data to indicate error */
+        sock->_wreq.bufs = sock->_wreq.smallbufs;
+        sock->_wreq.cnt = 1;
+        *sock->_wreq.bufs = h2o_iovec_init(H2O_STRLIT("deadbeef"));
+        sock->_flags |= H2O_SOCKET_FLAG_IS_WRITE_NOTIFY;
+        link_to_pending(sock);
+        return;
+    }
+#else
     /* try to write now */
     if (write_core(sock->fd, &bufs, &bufcnt, &first_buf_written) != 0) {
         /* fill in _wreq.bufs with fake data to indicate error */
@@ -303,6 +450,7 @@ void do_write(h2o_socket_t *_sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_socket_
 
     /* schedule the write */
     link_to_statechanged(sock);
+#endif
 }
 
 int h2o_socket_get_fd(h2o_socket_t *_sock)

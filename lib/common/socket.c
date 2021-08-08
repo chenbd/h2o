@@ -591,7 +591,7 @@ size_t h2o_socket_do_prepare_for_latency_optimized_write(h2o_socket_t *sock,
                                                          const h2o_socket_latency_optimization_conditions_t *conditions)
 {
     uint32_t rtt = 0, mss = 0, cwnd_size = 0, cwnd_avail = 0;
-    uint64_t loop_time = UINT64_MAX;
+    uint64_t loop_time = UINT32_MAX;
     int can_prepare = 1;
 
 #if !defined(TCP_NOTSENT_LOWAT)
@@ -601,6 +601,8 @@ size_t h2o_socket_do_prepare_for_latency_optimized_write(h2o_socket_t *sock,
 
 #if H2O_USE_LIBUV
     /* poll-then-write is impossible with libuv */
+    can_prepare = 0;
+#elif !defined(H2O_SLIDING_COUNTER)
     can_prepare = 0;
 #else
     if (can_prepare)

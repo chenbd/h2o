@@ -962,10 +962,12 @@ typedef struct st_h2o_http2_debug_state_t {
 typedef struct st_h2o_conn_callbacks_t {
     /**
      * getsockname (return size of the obtained address, or 0 if failed)
+     * the param *sa* indeed is the type of 'struct sockaddr_storage *'
      */
     socklen_t (*get_sockname)(h2o_conn_t *conn, struct sockaddr *sa);
     /**
      * getpeername (return size of the obtained address, or 0 if failed)
+     * the param *sa* indeed is the type of 'struct sockaddr_storage *'
      */
     socklen_t (*get_peername)(h2o_conn_t *conn, struct sockaddr *sa);
     /**
